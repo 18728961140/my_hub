@@ -62,6 +62,15 @@ def _candidate_shapes(data, model_class) -> list:
       2. 对象被包成数组         -> [{"intent": "倾诉"}]（取其中一个元素）
       3. MemoryExtract 的 items 内容直接成了顶层数组
          -> [{"category": ...}, ...]（需包回 {"items": [...]}）
+
+    # 目标：Intent，期望输出 {"intent": "倾诉"}
+    data = [{"intent": "倾诉"}]     # 形态 2：外层数组 = 多余包装
+    # 拆开取元素 -> {"intent": "倾诉"} 校验通过
+
+    # 目标：MemoryExtract，期望输出 {"items": [{...}, ...]}
+    data = [{"category": "情绪", "content": "焦虑"}, {"category": "背景", "content": "程序员"}]
+    # 形态 3：这个数组本来就是 items 的内容，缺的是 {"items":} 外壳
+    # 包回去 -> {"items": [...]} 校验通过
     """
     if isinstance(data, dict):
         return [data]                # 形态 1：直接当对象校验
