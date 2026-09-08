@@ -18,11 +18,11 @@ LangGraph 把工作流拆成一个个 Node（节点），每个节点就是一�
 """
 
 import json
+import logging
 import re
-from typing import Literal
+from typing import Literal, get_origin
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langgraph.store.base import BaseStore
@@ -33,6 +33,8 @@ from models.llm import qwen_llm
 from retriever.bm25_retriever import retrieve
 from tools.memory_tools import save_memory
 from tools.rag_tools import retrieve_knowledge
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -52,23 +54,102 @@ class Intent(BaseModel):
     )
 
 
-def _parse_model_json(text: str, model_class):
-    """把模型文本解析成指定的 Pydantic 模型，兼容数组/代码块/前后缀文字。
+def _candidate_shapes(data, model_class) -> list:
+    """按目标 schema 生成"可能正确的载荷形态"，供逐个尝试校验。
 
-    运行中发现：大模型偶尔会把结构化结果包成数组（如 [{"intent": "倾诉"}]），
-    或带 ```json 代码块、前后缀解释文字。with_structured_output 遇到这些
-    返回会直接校验崩溃，所以统一走"文本 + _extract_json 容错解析"。
-    _extract_json 定义在本文件靠后位置，函数调用发生在模块加载完成之后，无影响。
+    模型输出的文本形态不稳定，常见三种：
+      1. 直接是对象            -> {"intent": "倾诉"}（原样可用）
+      2. 对象被包成数组         -> [{"intent": "倾诉"}]（取其中一个元素）
+      3. MemoryExtract 的 items 内容直接成了顶层数组
+         -> [{"category": ...}, ...]（需包回 {"items": [...]}）
+    """
+    if isinstance(data, dict):
+        return [data]                # 形态 1：直接当对象校验
+    if not isinstance(data, list):
+        return []                    # 非对象非数组：没有可尝试的形态
+    shapes = []
+    # 形态 3：目标 schema 含 list 字段（如 MemoryExtract.items）时，
+    # 顶层数组可能是该字段的内容，包一层再校验
+    for field_name, field_info in model_class.model_fields.items():
+        if get_origin(field_info.annotation) is list:
+            shapes.append({field_name: data})
+    # 形态 2：逐个元素试，直到找到能通过校验的那一个
+    shapes.extend(item for item in data if isinstance(item, dict))
+    return shapes
+
+
+def _parse_model_json(text: str, model_class):
+    """把模型文本解析成指定的 Pydantic 模型（schema 感知 + 多形态容错）。
+
+    运行中发现：大模型偶尔把结构化结果包成数组（[{"intent": "倾诉"}]），
+    或把 MemoryExtract 的 items 内容直接输出成顶层数组，或带 ```json
+    代码块和前后缀文字。统一走"文本提取 + 多形态候选校验"兜底，
+    而不是见到数组就盲取第一个元素（那会让 MemoryExtract 丢记忆）。
     """
     data = _extract_json(text)
-    if isinstance(data, list):        # 兼容模型输出成数组 [{...}] 的情况
-        data = data[0] if data else None
-    if data is None:                  # 提取失败（空/乱码）
+    if data is None:                   # 提取失败（空/乱码）
         return None
-    try:
-        return model_class.model_validate(data)
-    except Exception:                 # 校验失败（缺字段/类型错）
-        return None
+    for candidate in _candidate_shapes(data, model_class):
+        try:
+            return model_class.model_validate(candidate)  # 这个形态校验成功
+        except Exception:              # 校验失败，试下一个形态
+            continue
+    return None                        # 所有形态都失败
+
+
+# 原生通道 + 文本兜底都失败时的重试提示（顶层必须是对象，不能是数组/代码块）
+_STRUCTURED_RETRY_HINT = (
+    "上次输出不是合法的 JSON 对象（可能包成了数组、带了 ```json 代码块"
+    "或解释文字）。请只输出一个符合要求的 JSON 对象，"
+    "顶层不要用数组包裹，不要代码块，不要任何解释。"
+)
+
+
+def _invoke_structured(
+    messages: list,
+    model_class,
+    *,
+    retries: int = 0,
+) -> object:
+    """优先走原生 json_mode 通道，失败退回文本容错解析，可选带提示重试。
+
+    冒烟测试结论（qwen3.8-27b）：
+      - json_mode 通道 6/6 成功，function_calling 只有 5/6——
+        空结果时模型可能直接输出文本 {"items": []} 而不发起工具调用，
+        所以这里默认 json_mode，function_calling 留作备选。
+      - include_raw 能拿到 parsing_error，解析失败时再对 raw.content
+        走一次 _parse_model_json 文本兜底（兼容数组/代码块等历史脏输出）。
+
+    返回值：model_class 实例；所有尝试都失败返回 None，由调用方按节点降级。
+    """
+    chain = qwen_llm.with_structured_output(
+        model_class, method="json_mode", include_raw=True
+    )
+    current_messages = messages
+    for attempt in range(retries + 1):
+        raw_result = chain.invoke(current_messages)
+        parsed = raw_result.get("parsed")
+        if parsed is not None:
+            return parsed
+        # 原生通道解析失败：退化到"文本提取 + 多形态校验"再救一次
+        raw = raw_result.get("raw")
+        content = getattr(raw, "content", "") if raw is not None else ""
+        parsed = _parse_model_json(content or "", model_class)
+        if parsed is not None:
+            return parsed
+        # 观测层：记录失败样本（截断内容，便于统计格式失败率）
+        logger.warning(
+            "结构化输出解析失败（第 %d 次）：schema=%s, content=%r",
+            attempt + 1,
+            model_class.__name__,
+            (content or "")[:120],
+        )
+        if attempt < retries:
+            # 把格式错误反馈回模型，给它一次纠错机会
+            current_messages = current_messages + [
+                SystemMessage(content=_STRUCTURED_RETRY_HINT)
+            ]
+    return None
 
 
 def _last_user_message(state: ChatState) -> str:
@@ -117,36 +198,53 @@ def _recent_context(
       3. 返回列表的结尾就是用户最新提问，节点把它拼在 SystemMessage 之后
          直接调用模型，不再单独重复注入。
     """
+    # 复制消息历史，避免影响原列表
     msgs = list(state["messages"])
 
-    # 找到最近第 rounds 条用户消息的位置，从那里开始保留
+    # ---------- 第一步：按"轮数"截断，只留最近的 rounds 轮 ----------
+    # 起点默认 0：用户消息不足 rounds 条时就保留全部
     start = 0
+    # 从末尾往回数，已经遇到了几条用户消息
     human_seen = 0
+    # range(len-1, -1, -1) = 从最后一个下标倒序走到 0
     for i in range(len(msgs) - 1, -1, -1):
+        # 每条 HumanMessage 是一轮对话的开头
         if isinstance(msgs[i], HumanMessage):
+            # 倒着数到一条，就多算一轮
             human_seen += 1
+            # 数满 rounds 条，就锁定了"最近第 rounds 轮"的起点
             if human_seen >= rounds:
                 start = i
-                break
+                break  # 起点已确定，不必继续往前扫
+    # 从该轮起点截到末尾：含当前提问及其后的全部 AI 回复
     kept = msgs[start:]
 
-    # 字符上限：超长时从最早的一整轮开始丢弃
+    # ---------- 第二步：按"字符数"截断，仍超长就丢最旧的一整轮 ----------
+    # 字符数超预算，且还有可丢的轮次时，循环继续
     while kept and _context_chars(kept) > max_chars:
+        # 先找当前最旧一轮的开头（kept 里的第一条 HumanMessage）
         first_human = None
+        # 从头往后遍历 kept
         for i, message in enumerate(kept):
+            # 遇到用户消息就是最旧一轮的起点
             if isinstance(message, HumanMessage):
                 first_human = i
                 break
+        # 没有用户消息（异常数据），无从按轮丢弃
         if first_human is None:
             break
-        # 找下一轮的起点（第一个 HumanMessage 之后的下一个 HumanMessage）
+        # 再找第二条 HumanMessage，用它划出"最旧一整轮"的结束边界
         next_human = None
+        # 从最旧一轮开头的下一条开始继续找
         for i in range(first_human + 1, len(kept)):
+            # 遇到的 HumanMessage 就是下一轮的开头
             if isinstance(kept[i], HumanMessage):
                 next_human = i
                 break
+        # 找不到下一轮，说明只剩最后一轮，不能再丢（宁可超长）
         if next_human is None:
-            break  # 只剩最后一轮，不能继续丢
+            break
+        # 从下一轮开头切片，等于丢掉最旧的那一整轮（用户提问 + 对应回复）
         kept = kept[next_human:]
     return kept
 
@@ -171,12 +269,12 @@ def classify_node(state: ChatState) -> dict:
 - 倾诉：涉及情绪困扰、心理压力、情感问题、焦虑、抑郁、人际冲突等，需要心理支持或陪伴。
 - 危机：涉及自伤、自杀、轻生等严重心理危机，需要紧急干预。
 - 求助：明确询问心理知识、应对方法、专业帮助渠道等知识性问题。
-只输出判断结果，不要解释。"""),
+只输出一个 JSON 对象，例如 {"intent": "倾诉"}；
+不要数组、不要代码块、不要任何解释。"""),
     ] + context
 
-    # 直接文本输出 + 容错解析（见 _parse_model_json 说明）
-    raw = qwen_llm.invoke(messages)
-    result = _parse_model_json(raw.content, Intent)
+    # 原生 json_mode 通道 + 文本容错解析（见 _invoke_structured 说明）
+    result = _invoke_structured(messages, Intent)
 
     # 解析失败的兜底：按"倾诉"处理，走深度倾诉路径而不是让请求崩溃
     if result is None:
@@ -231,15 +329,16 @@ def crisis_check_node(state: ChatState) -> dict:
 请根据最新发言、并结合上下文，判断是否存在自伤、自杀等严重心理危机风险：
 - high：明确或强烈暗示想伤害自己、结束生命，或处于极度绝望中
 - normal：没有明显危机信号
-只输出 risk，不要解释。"""),
+只输出一个 JSON 对象，例如 {"risk": "high"}；
+不要数组、不要代码块、不要任何解释。"""),
     ] + context
 
-    # 直接文本输出 + 容错解析（见 _parse_model_json 说明）
-    raw = qwen_llm.invoke(messages)
-    result = _parse_model_json(raw.content, CrisisRisk)
-    # 解析失败的兜底：按 normal 处理（关键词快检已兜住明显危机词）
+    # 原生 json_mode 通道 + 文本容错解析；危机复核允许带提示重试一次
+    result = _invoke_structured(messages, CrisisRisk, retries=1)
+    # 解析失败按 high 兜底（fail-closed）：宁可误报进危机通道，
+    # 也不能让真实危机因为格式问题漏进普通倾诉
     if result is None:
-        result = CrisisRisk(risk="normal")
+        result = CrisisRisk(risk="high")
     return {"risk_level": result.risk}
 
 
@@ -446,21 +545,6 @@ def _extract_json(text: str):
     return None
 
 
-def _parse_reflection_response(text: str) -> Reflection:
-    """解析反思结果，兼容对象/数组/代码块等格式；失败一律按"通过"兜底"""
-    data = _extract_json(text)        # 从模型输出提取 JSON（去代码块/截取 {} 或 []）
-    if data is None:                  # 提取失败（空/乱码）：按"通过"兜底
-        return Reflection(score=10, passed=True, feedback="")
-    if isinstance(data, list):        # 兼容模型输出成数组 [{...}] 的情况
-        if not data:                  # 空数组：按"通过"兜底
-            return Reflection(score=10, passed=True, feedback="")
-        data = data[0]                # 非空：取第一个元素作为评估结果
-    try:
-        return Reflection.model_validate(data)  # 校验并转成 Reflection 对象
-    except Exception:                 # 校验失败（缺字段/类型错）：按"通过"兜底
-        return Reflection(score=10, passed=True, feedback="")
-
-
 def reflect_node(state: ChatState) -> dict:
     """反思节点：对 deep_talk 的回答做质量自评，不合格则带着建议重答一次。
 
@@ -486,18 +570,22 @@ def reflect_node(state: ChatState) -> dict:
 - 温暖度：语气是否温暖、共情、不评判
 - 专业性：是否专业、有依据、给出可操作建议
 - 安全性：是否避免医学诊断、是否在危机场景给出求助渠道
-输出 0-10 分，并判断是否通过（passed）。未通过时给出具体改进建议（feedback）。"""),
+输出 0-10 分，并判断是否通过（passed）。未通过时给出具体改进建议（feedback）。
+只输出一个 JSON 对象，格式如 {"score": 8, "passed": true, "feedback": "建议"}；
+不要数组、不要代码块、不要任何解释。"""),
         ("human", "用户问题：{question}\n\n助手回答：{answer}"),
     ])
-    # 这里不用 with_structured_output，而是自己解析 JSON：
-    # 模型偶尔会把结果包成数组 [{...}]，with_structured_output 会解析崩溃，
-    # 自定义解析可以兼容 {…} 和 [{…}] 两种格式，更稳。
-    chain = prompt | qwen_llm | StrOutputParser()
-    raw = chain.invoke({
-        "question": _last_user_message(state),
-        "answer": last_ai.content,
-    })
-    result = _parse_reflection_response(raw)
+    # 原生 json_mode 通道 + 文本容错解析；
+    # 自评失败按"通过"兜底，避免格式问题导致无限重答
+    result = _invoke_structured(
+        prompt.format_messages(
+            question=_last_user_message(state),
+            answer=last_ai.content,
+        ),
+        Reflection,
+    )
+    if result is None:
+        result = Reflection(score=10, passed=True, feedback="")
 
     retries = state.get("reflect_retries", 0)
     if not result.passed and retries < MAX_REFLECT_RETRIES and last_ai.id:
@@ -574,13 +662,16 @@ def remember_node(state: ChatState, config: RunnableConfig, store: BaseStore) ->
 - 情绪：长期或反复出现的情绪状态
 - 经历：重要的人生经历或事件
 - 偏好：喜好、习惯等
-只提取明确、有价值的信息；没有则返回空列表。"""),
+只提取明确、有价值的信息；没有则返回空列表。
+只输出一个 JSON 对象，格式如 {"items": [{"category": "背景", "content": "..."}]}；
+不要数组、不要代码块、不要任何解释。"""),
         ("human", "{input}"),
     ])
 
-    # 直接文本输出 + 容错解析（模型可能把结果包成数组/代码块/带前后缀文字）
-    raw = qwen_llm.invoke(prompt.format_messages(input=last_input))
-    result = _parse_model_json(raw.content, MemoryExtract)
+    # 原生 json_mode 通道 + 文本容错解析；记忆提取允许重试一次
+    result = _invoke_structured(
+        prompt.format_messages(input=last_input), MemoryExtract, retries=1
+    )
     if result is None:
         result = MemoryExtract(items=[])
 
