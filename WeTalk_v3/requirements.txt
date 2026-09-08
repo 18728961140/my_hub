@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-dotenv
+
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
+
+langgraph
+langgraph-checkpoint-sqlite
+
+jieba
+rank-bm25
