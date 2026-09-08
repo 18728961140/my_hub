@@ -78,7 +78,81 @@ git push company master
 
 ---
 
-## 三、一次性配置（个人仓库 my_hub 已配好可跳过）
+## 三、分支开发：在独立时间线上做功能
+
+> 核心：分支 = 一条独立的提交时间线。`master` 是主时间线，功能分支从上面岔出去，互不干扰；做完后合并回 `master`，再推送。
+
+```text
+master:   A --- B（主时间线，稳定版）
+              \
+feature:       C --- D（新功能，做完合并回 master）
+```
+
+### 1. 动手前：先处理未提交的改动
+
+未提交的改动**不属于任何分支**，切换分支时会跟着你走。开新分支前先定型：
+
+```bash
+git add .
+git commit -m "说明"      # 把当前改动提交掉
+
+# 或者临时放下手头的活：
+git stash                 # 暂存改动，切回时用 git stash pop 恢复
+```
+
+### 2. 从主线拉出新分支
+
+```bash
+git switch master                  # 先回到主时间线
+git switch -c feature/新功能名      # 创建并切换到功能分支
+```
+
+之后随时用 `git status` 或 `git branch` 查看当前在哪个分支。
+
+### 3. 在分支上开发，多次提交
+
+每完成一个逻辑单元就提交一次，提交信息写清楚做了什么：
+
+```bash
+git add .
+git commit -m "feat: 增加搜索接口"
+```
+
+### 4. 推送到远程
+
+```bash
+git push -u origin feature/新功能名   # 第一次带 -u，GitHub 和 Gitee 会同时建分支
+```
+
+以后在该分支上只需 `git push`。
+
+### 5. 合并回主线
+
+```bash
+git switch master                    # 回到主时间线
+git pull                             # 先拉最新代码（只从 GitHub 拉）
+git merge feature/新功能名            # 把功能分支并入 master
+git push                             # 同时推送到 GitHub 和 Gitee
+```
+
+合并时提示冲突：打开冲突文件手动保留正确代码 → `git add 冲突文件` → `git commit` 收尾。
+
+### 6. 删除用完的分支
+
+```bash
+git branch -d feature/新功能名              # 删本地
+git push origin --delete feature/新功能名   # 删远程（两个平台一起删）
+```
+
+### 7. 三个要点
+
+- 分支之间互不影响，但**未提交的改动会跟着切换走**：养成“先提交或 stash，再切分支”的习惯；
+- `git pull` 只从 GitHub 收代码，推送才同时发 GitHub + Gitee；
+- 新功能开分支，小修补可直接在 master 上提交（个人仓库从简）。
+
+---
+
+## 四、一次性配置（个人仓库 my_hub 已配好可跳过）
 
 ### 1. 设置身份
 
@@ -122,7 +196,7 @@ git push -u origin master --force
 
 ---
 
-## 四、其他常用指令
+## 五、其他常用指令
 
 ```bash
 git log --oneline          # 查看提交历史
@@ -136,7 +210,7 @@ git clone <仓库地址>        # 克隆仓库
 
 ---
 
-## 五、SSH 密钥（一次性）
+## 六、SSH 密钥（一次性）
 
 密钥位置：`C:\Users\yhc\.ssh\id_rsa`（私钥，勿外传）和 `id_rsa.pub`（公钥）。
 
@@ -165,7 +239,7 @@ icacls "C:\Users\yhc\.ssh\id_rsa" /grant:r "%USERNAME%:R"
 
 ---
 
-## 六、报错速查
+## 七、报错速查
 
 | 报错 | 原因 | 解决 |
 | --- | --- | --- |
